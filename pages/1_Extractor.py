@@ -11,6 +11,21 @@ MODEL = "claude-sonnet-5-5"
 # The rule for missing values, used in the Nullable tool's descriptions.
 NULL_RULE = "Use null if the document does not state this value. Never estimate, infer or calculate a missing value."
 
+# Same instruction for every extraction request, including retries.
+SYSTEM_PROMPT = "Always call the extract_document tool once with the data from the user's document."
+
+# How many extra requests we make when the numbers don't add up.
+MAX_RETRIES = 2
+
+# Two amounts count as equal if they differ by at most this much (rounding on receipts).
+TOLERANCE = 0.01
+
+# Sent to Claude, together with the list of errors, when the numbers don't add up.
+RETRY_INSTRUCTION = (
+    "Re-read the document carefully. If the document itself shows these numbers, return them unchanged. "
+    "Never change a value to make the arithmetic work."
+)
+
 
 def get_extraction_tool():
     """The one tool Claude can use on this page. Edit fields here."""
@@ -171,6 +186,114 @@ def find_missing_fields(extraction):
     return missing
 
 
+def close_enough(a, b):
+    return abs(a - b) <= TOLERANCE
+
+
+def check_totals(extraction):
+    """Check that the extracted numbers add up.
+
+    Returns two lists:
+    - errors: the numbers are stated but don't add up (worth asking Claude to re-read).
+    - cannot_verify: a check couldn't run because a value is missing (not worth a retry).
+    """
+    errors = []
+    cannot_verify = []
+
+    subtotal, tax, total = extraction.subtotal, extraction.tax, extraction.total
+    amounts = [item.amount for item in extraction.line_items]
+
+    # Why the line items can't be added up, or None if they can.
+    # (With no line items at all, the sum would be 0, which would wrongly fail the checks.)
+    if not amounts:
+        amounts_problem = "no line items found"
+    elif any(amount is None for amount in amounts):
+        amounts_problem = "a line item amount not stated"
+    else:
+        amounts_problem = None
+    amounts_sum = None if amounts_problem else sum(amounts)
+
+    # Rule 1: the line items add up to the subtotal.
+    reasons = []
+    if subtotal is None:
+        reasons.append("subtotal not stated")
+    if amounts_problem:
+        reasons.append(amounts_problem)
+    if reasons:
+        cannot_verify.append(f"Cannot verify: {', '.join(reasons)} (line items vs subtotal)")
+    elif not close_enough(amounts_sum, subtotal):
+        errors.append(f"Line items add up to {amounts_sum:,.2f}, but the subtotal is {subtotal:,.2f}.")
+
+    # Rule 2: subtotal + tax = total.
+    reasons = [f"{name} not stated" for name, value in
+               [("subtotal", subtotal), ("tax", tax), ("total", total)] if value is None]
+    if reasons:
+        cannot_verify.append(f"Cannot verify: {', '.join(reasons)} (subtotal + tax vs total)")
+    elif not close_enough(subtotal + tax, total):
+        errors.append(
+            f"Subtotal {subtotal:,.2f} + tax {tax:,.2f} = {subtotal + tax:,.2f}, but the total is {total:,.2f}."
+        )
+
+    # Rule 3: with no subtotal and no tax, the line items add up to the total.
+    if subtotal is None and tax is None:
+        reasons = []
+        if total is None:
+            reasons.append("total not stated")
+        if amounts_problem:
+            reasons.append(amounts_problem)
+        if reasons:
+            cannot_verify.append(f"Cannot verify: {', '.join(reasons)} (line items vs total)")
+        elif not close_enough(amounts_sum, total):
+            errors.append(f"Line items add up to {amounts_sum:,.2f}, but the total is {total:,.2f}.")
+
+    return errors, cannot_verify
+
+
+def key_numbers(extraction):
+    """The numbers the checks use. If two attempts give the same ones, retrying again won't help."""
+    return (
+        extraction.subtotal,
+        extraction.tax,
+        extraction.total,
+        [item.amount for item in extraction.line_items],
+    )
+
+
+def find_tool_block(response):
+    """The extract_document tool call in Claude's reply, or None if there isn't one."""
+    return next(
+        (b for b in response.content if b.type == "tool_use" and b.name == "extract_document"),
+        None,
+    )
+
+
+def call_claude(messages, tool):
+    """Send the conversation so far. On an API error, show a message and stop the page."""
+    try:
+        return client.beta.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            # This model doesn't allow forcing a tool, so we ask for it in plain words instead.
+            system=SYSTEM_PROMPT,
+            tools=[tool],
+            # "auto" lets Claude choose; disable_parallel_tool_use caps it at one tool call.
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+            messages=messages,
+            # If Claude declines for safety reasons, let the API retry on a suitable fallback model.
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+        )
+    except anthropic.AuthenticationError:
+        st.error("The API key was rejected. Check .streamlit/secrets.toml.")
+    except anthropic.RateLimitError:
+        st.error("Rate limited. Wait a moment and try again.")
+    except anthropic.APIStatusError as e:
+        st.error(f"API error ({e.status_code}): {e.message}")
+    except anthropic.APIConnectionError:
+        st.error("Couldn't reach the API. Check your internet connection.")
+    st.stop()
+
+
 def show_text(value):
     return "—" if value is None else value
 
@@ -182,6 +305,11 @@ def show_money(value):
 st.title("Receipt / Invoice Extractor")
 
 schema_mode = st.sidebar.radio("Schema mode", ["Required", "Nullable"])
+# For testing the retry loop: pretend the first line item was read 10x too big.
+simulate_misread = st.sidebar.checkbox(
+    "Simulate a misread",
+    help="Multiplies the first line item's amount by 10 after the first extraction only.",
+)
 
 # The key comes from .streamlit/secrets.toml, which git ignores.
 client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
@@ -195,42 +323,17 @@ if st.button("Extract"):
 
     tool = get_extraction_tool() if schema_mode == "Required" else get_nullable_extraction_tool()
 
-    try:
-        with st.spinner("Extracting..."):
-            response = client.beta.messages.create(
-                model=MODEL,
-                max_tokens=16000,
-                # This model doesn't allow forcing a tool, so we ask for it in plain words instead.
-                system="Always call the extract_document tool once with the data from the user's document.",
-                tools=[tool],
-                # "auto" lets Claude choose; disable_parallel_tool_use caps it at one tool call.
-                tool_choice={"type": "auto", "disable_parallel_tool_use": True},
-                messages=[{"role": "user", "content": document_text}],
-                # If Claude declines for safety reasons, let the API retry on a suitable fallback model.
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-            )
-    except anthropic.AuthenticationError:
-        st.error("The API key was rejected. Check .streamlit/secrets.toml.")
-        st.stop()
-    except anthropic.RateLimitError:
-        st.error("Rate limited. Wait a moment and try again.")
-        st.stop()
-    except anthropic.APIStatusError as e:
-        st.error(f"API error ({e.status_code}): {e.message}")
-        st.stop()
-    except anthropic.APIConnectionError:
-        st.error("Couldn't reach the API. Check your internet connection.")
-        st.stop()
+    # The conversation so far. Retries add to it; nothing earlier is ever changed.
+    messages = [{"role": "user", "content": document_text}]
+
+    with st.spinner("Extracting..."):
+        response = call_claude(messages, tool)
 
     # "tool_use" is the normal value here: it means Claude called the tool.
     st.write(f"**stop_reason:** {response.stop_reason}")
 
     # Find the tool call in the reply. Its .input is the extracted data, already a dict.
-    tool_block = next(
-        (b for b in response.content if b.type == "tool_use" and b.name == "extract_document"),
-        None,
-    )
+    tool_block = find_tool_block(response)
     if tool_block is None:
         st.error("Claude didn't call extract_document, so there's nothing to show.")
         text = "".join(b.text for b in response.content if b.type == "text")
@@ -246,6 +349,68 @@ if st.button("Extract"):
         with st.expander("Raw tool input"):
             st.json(tool_block.input)
         st.stop()
+
+    # Simulated misread: change OUR copy of the first amount. What Claude actually sent stays
+    # untouched in the conversation, so on a retry Claude re-reads the document and should
+    # return the real number.
+    misread_applied = False
+    if simulate_misread and extraction.line_items and extraction.line_items[0].amount is not None:
+        extraction = extraction.model_copy(deep=True)
+        extraction.line_items[0].amount *= 10
+        misread_applied = True
+
+    errors, cannot_verify = check_totals(extraction)
+    # One entry per attempt, shown in the "Attempt log" expander at the end.
+    attempt_log = [{"attempt": 1, "errors": errors, "notes": cannot_verify, "misread": misread_applied}]
+    retries_used = 0
+    stop_message = None  # Why the retry loop ended early, if it did.
+
+    # Retry only when numbers are stated but don't add up. Missing values (cannot_verify) never retry.
+    while errors and retries_used < MAX_RETRIES:
+        retries_used += 1
+
+        # Add Claude's last reply exactly as it came back, then tell Claude its tool call
+        # produced numbers that don't add up (is_error marks it as a failed result).
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_block.id,
+                "is_error": True,
+                "content": "The extracted numbers don't add up:\n"
+                           + "\n".join(f"- {error}" for error in errors)
+                           + "\n\n" + RETRY_INSTRUCTION,
+            }],
+        })
+
+        with st.spinner(f"Numbers don't add up. Asking Claude to re-read (retry {retries_used} of {MAX_RETRIES})..."):
+            response = call_claude(messages, tool)
+
+        new_tool_block = find_tool_block(response)
+        if new_tool_block is None:
+            stop_message = f"Retry {retries_used}: Claude didn't call extract_document, so we kept the previous result."
+            attempt_log.append({"attempt": retries_used + 1, "errors": [stop_message], "notes": [], "misread": False})
+            break
+
+        # Same Pydantic check as the first attempt.
+        try:
+            new_extraction = Extraction.model_validate(new_tool_block.input)
+        except ValidationError as e:
+            stop_message = f"Retry {retries_used}: the data didn't have the expected shape, so we kept the previous result."
+            attempt_log.append({"attempt": retries_used + 1, "errors": [stop_message, str(e)], "notes": [], "misread": False})
+            break
+
+        new_errors, new_notes = check_totals(new_extraction)
+        attempt_log.append({"attempt": retries_used + 1, "errors": new_errors, "notes": new_notes, "misread": False})
+
+        same_numbers = key_numbers(new_extraction) == key_numbers(extraction)
+        tool_block, extraction, errors, cannot_verify = new_tool_block, new_extraction, new_errors, new_notes
+
+        # Claude read the same numbers again: the document itself probably doesn't add up.
+        if same_numbers:
+            stop_message = "Claude returned the same numbers again, so we stopped retrying."
+            break
 
     st.write(f"**Mode:** {schema_mode}")
 
@@ -274,3 +439,31 @@ if st.button("Extract"):
 
     with st.expander("Extracted JSON"):
         st.json(extraction.model_dump())
+
+    st.subheader("Arithmetic check")
+    st.write(f"**Retries used:** {retries_used} of {MAX_RETRIES}")
+    if stop_message:
+        st.caption(stop_message)
+
+    # Errors win over notes: numbers that don't add up need a person to look.
+    if errors:
+        st.badge("Needs human review: document arithmetic inconsistent", color="red")
+        st.markdown("\n".join(f"- {error}" for error in errors))
+    elif cannot_verify:
+        st.badge("Cannot verify", color="orange")
+        st.markdown("\n".join(f"- {note}" for note in cannot_verify))
+    else:
+        st.badge("Verified", color="green")
+
+    with st.expander("Attempt log"):
+        for entry in attempt_log:
+            label = f"**Attempt {entry['attempt']}**"
+            if entry["misread"]:
+                label += " (simulated misread: first line item amount x10)"
+            st.markdown(label)
+            if entry["errors"]:
+                st.markdown("\n".join(f"- {error}" for error in entry["errors"]))
+            else:
+                st.write("No errors.")
+            if entry["notes"]:
+                st.markdown("\n".join(f"- {note}" for note in entry["notes"]))
