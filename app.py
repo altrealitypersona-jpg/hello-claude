@@ -1,7 +1,12 @@
 import anthropic
 import streamlit as st
 
+from auth import require_passcode
+
 MODEL = "claude-sonnet-5-5"
+
+# Ask for the passcode before showing anything or calling the API.
+require_passcode()
 
 st.title("Hello, Claude")
 

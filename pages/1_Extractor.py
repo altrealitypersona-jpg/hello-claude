@@ -1,8 +1,11 @@
+import json
 from typing import Literal
 
 import anthropic
 import streamlit as st
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+from auth import require_passcode
 
 # Same model as app.py. (We copy the line instead of importing app.py,
 # because importing it would also run app.py's page code.)
@@ -12,7 +15,19 @@ MODEL = "claude-sonnet-5-5"
 NULL_RULE = "Use null if the document does not state this value. Never estimate, infer or calculate a missing value."
 
 # Same instruction for every extraction request, including retries.
+# (Nullable mode adds worked examples after it; see build_nullable_system_prompt.)
 SYSTEM_PROMPT = "Always call the extract_document tool once with the data from the user's document."
+
+# The fields that get a confidence rating, in the order the Field review table shows them.
+KEY_FIELDS = ["vendor_name", "document_date", "currency", "subtotal", "tax", "total"]
+MONEY_FIELDS = {"subtotal", "tax", "total"}
+
+# Explains the confidence levels to Claude, in the Nullable tool's confidence field.
+CONFIDENCE_RULE = (
+    "high = printed clearly in the document; medium = stated but needed interpretation "
+    "(unusual format, abbreviation); low = partly unreadable, ambiguous, or guessed. "
+    "A null value gets high if the document clearly does not state it."
+)
 
 # How many extra requests we make when the numbers don't add up.
 MAX_RETRIES = 2
@@ -132,14 +147,138 @@ def get_nullable_extraction_tool():
                 "subtotal": {"type": ["number", "null"], "description": f"Total before tax. {NULL_RULE}"},
                 "tax": {"type": ["number", "null"], "description": f"Tax amount. {NULL_RULE}"},
                 "total": {"type": ["number", "null"], "description": f"Final amount due or paid. {NULL_RULE}"},
+                # How sure Claude is about each key field. Only this tool has it.
+                "confidence": {
+                    "type": "object",
+                    "description": CONFIDENCE_RULE,
+                    "properties": {
+                        name: {"type": "string", "enum": ["high", "medium", "low"]}
+                        for name in KEY_FIELDS
+                    },
+                    "required": KEY_FIELDS,
+                    "additionalProperties": False,
+                },
             },
             "required": [
                 "document_type", "document_type_detail", "vendor_name", "document_date", "currency",
-                "line_items", "subtotal", "tax", "total",
+                "line_items", "subtotal", "tax", "total", "confidence",
             ],
             "additionalProperties": False,
         },
     }
+
+
+# Worked examples for Nullable mode: a short document and the exact tool input Claude should send.
+# Each "input" must match the Nullable tool's schema exactly (tested offline against it).
+FEW_SHOT_EXAMPLES = [
+    {
+        # European format: comma decimals, prices already include VAT (MwSt).
+        "document": (
+            "Bäckerei Sonnenschein\n"
+            "Hauptstraße 12, 10115 Berlin\n"
+            "Datum: 14.03.2026\n"
+            "2 x Brötchen       à 0,60     1,20\n"
+            "1 x Kaffee groß    à 3,40     3,40\n"
+            "1 x Apfelkuchen    à 2,90     2,90\n"
+            "Summe EUR                     7,50\n"
+            "Netto                         7,01\n"
+            "enth. MwSt 7%                 0,49"
+        ),
+        "input": {
+            "document_type": "receipt",
+            "document_type_detail": None,
+            "vendor_name": "Bäckerei Sonnenschein",
+            "document_date": "2026-03-14",
+            "currency": "EUR",
+            "line_items": [
+                {"description": "Brötchen", "quantity": 2, "unit_price": 0.60, "amount": 1.20},
+                {"description": "Kaffee groß", "quantity": 1, "unit_price": 3.40, "amount": 3.40},
+                {"description": "Apfelkuchen", "quantity": 1, "unit_price": 2.90, "amount": 2.90},
+            ],
+            "subtotal": 7.01,
+            "tax": 0.49,
+            "total": 7.50,
+            "confidence": {
+                "vendor_name": "high", "document_date": "high", "currency": "high",
+                "subtotal": "high", "tax": "high", "total": "high",
+            },
+        },
+    },
+    {
+        # A chatty note: most things aren't stated, so they're null, and null counts as high
+        # because the note clearly doesn't state them.
+        "document": "hey!! finally paid the plumber for the sink, 240 USD, so that's done lol",
+        "input": {
+            "document_type": "other",
+            "document_type_detail": "informal note about a payment",
+            "vendor_name": None,
+            "document_date": None,
+            "currency": "USD",
+            "line_items": [],
+            "subtotal": None,
+            "tax": None,
+            "total": 240,
+            "confidence": {
+                "vendor_name": "high", "document_date": "high", "currency": "high",
+                "subtotal": "high", "tax": "high", "total": "high",
+            },
+        },
+    },
+    {
+        # OCR damage: the total is partly unreadable. It's null (we never calculate it from
+        # subtotal + tax) with low confidence. The "$" needed interpreting as USD, so medium.
+        "document": (
+            "SUPERMKT FRSHWAY #0412\n"
+            "2026-05-02  18:44\n"
+            "MILK 2L        1 @ $2.49    $2.49\n"
+            "BREAD WHL      2 @ $1.85    $3.70\n"
+            "APPLES 1KG     1 @ $3.20    $3.20\n"
+            "SUBTOTAL                    $9.39\n"
+            "TAX                         $0.75\n"
+            "TOTAL                      $1?.1#"
+        ),
+        "input": {
+            "document_type": "receipt",
+            "document_type_detail": None,
+            "vendor_name": "SUPERMKT FRSHWAY",
+            "document_date": "2026-05-02",
+            "currency": "USD",
+            "line_items": [
+                {"description": "MILK 2L", "quantity": 1, "unit_price": 2.49, "amount": 2.49},
+                {"description": "BREAD WHL", "quantity": 2, "unit_price": 1.85, "amount": 3.70},
+                {"description": "APPLES 1KG", "quantity": 1, "unit_price": 3.20, "amount": 3.20},
+            ],
+            "subtotal": 9.39,
+            "tax": 0.75,
+            "total": None,
+            "confidence": {
+                "vendor_name": "high", "document_date": "high", "currency": "medium",
+                "subtotal": "high", "tax": "high", "total": "low",
+            },
+        },
+    },
+]
+
+
+def build_nullable_system_prompt():
+    """The base instruction, followed by the worked examples written out as text."""
+    parts = [
+        SYSTEM_PROMPT,
+        "Below are example documents and the exact extract_document input to send for each. "
+        "They show the format and the rules for null and confidence; take every value only from the user's document.",
+    ]
+    for i, example in enumerate(FEW_SHOT_EXAMPLES, start=1):
+        parts.append(
+            f'<example index="{i}">\n'
+            f"<document>\n{example['document']}\n</document>\n"
+            f"<extract_document_input>\n{json.dumps(example['input'], indent=2, ensure_ascii=False)}\n"
+            f"</extract_document_input>\n"
+            f"</example>"
+        )
+    return "\n\n".join(parts)
+
+
+NULLABLE_SYSTEM_PROMPT = build_nullable_system_prompt()
 
 
 # Pydantic models: a second, local check that the data has the shape we expect.
@@ -152,6 +291,20 @@ class LineItem(BaseModel):
     quantity: float | None
     unit_price: float | None
     amount: float | None
+
+
+ConfidenceLevel = Literal["high", "medium", "low"]
+
+
+class Confidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    vendor_name: ConfidenceLevel
+    document_date: ConfidenceLevel
+    currency: ConfidenceLevel
+    subtotal: ConfidenceLevel
+    tax: ConfidenceLevel
+    total: ConfidenceLevel
 
 
 class Extraction(BaseModel):
@@ -167,6 +320,8 @@ class Extraction(BaseModel):
     subtotal: float | None
     tax: float | None
     total: float | None
+    # Has a default because Required mode never sends this field.
+    confidence: Confidence | None = None
 
 
 def find_missing_fields(extraction):
@@ -214,6 +369,8 @@ def check_totals(extraction):
     amounts_sum = None if amounts_problem else sum(amounts)
 
     # Rule 1: the line items add up to the subtotal.
+    # Exception: on VAT-inclusive receipts (common in Europe) the line prices already include tax,
+    # so they add up to the total instead. That's fine as long as subtotal + tax = total too.
     reasons = []
     if subtotal is None:
         reasons.append("subtotal not stated")
@@ -222,7 +379,14 @@ def check_totals(extraction):
     if reasons:
         cannot_verify.append(f"Cannot verify: {', '.join(reasons)} (line items vs subtotal)")
     elif not close_enough(amounts_sum, subtotal):
-        errors.append(f"Line items add up to {amounts_sum:,.2f}, but the subtotal is {subtotal:,.2f}.")
+        tax_included = (
+            tax is not None
+            and total is not None
+            and close_enough(amounts_sum, total)
+            and close_enough(subtotal + tax, total)
+        )
+        if not tax_included:
+            errors.append(f"Line items add up to {amounts_sum:,.2f}, but the subtotal is {subtotal:,.2f}.")
 
     # Rule 2: subtotal + tax = total.
     reasons = [f"{name} not stated" for name, value in
@@ -267,14 +431,14 @@ def find_tool_block(response):
     )
 
 
-def call_claude(messages, tool):
+def call_claude(messages, tool, system):
     """Send the conversation so far. On an API error, show a message and stop the page."""
     try:
         return client.beta.messages.create(
             model=MODEL,
             max_tokens=16000,
-            # This model doesn't allow forcing a tool, so we ask for it in plain words instead.
-            system=SYSTEM_PROMPT,
+            # This model doesn't allow forcing a tool, so the system prompt asks for it in plain words.
+            system=system,
             tools=[tool],
             # "auto" lets Claude choose; disable_parallel_tool_use caps it at one tool call.
             tool_choice={"type": "auto", "disable_parallel_tool_use": True},
@@ -302,6 +466,16 @@ def show_money(value):
     return "—" if value is None else f"{value:,.2f}"
 
 
+def low_confidence_fields(extraction):
+    """Key fields Claude rated "low". Always empty in Required mode, which has no ratings."""
+    if extraction.confidence is None:
+        return []
+    return [name for name in KEY_FIELDS if getattr(extraction.confidence, name) == "low"]
+
+
+# Ask for the passcode before showing anything or calling the API.
+require_passcode()
+
 st.title("Receipt / Invoice Extractor")
 
 schema_mode = st.sidebar.radio("Schema mode", ["Required", "Nullable"])
@@ -321,13 +495,18 @@ if st.button("Extract"):
         st.warning("Paste a receipt or invoice first.")
         st.stop()
 
-    tool = get_extraction_tool() if schema_mode == "Required" else get_nullable_extraction_tool()
+    # The worked examples use nulls and confidence, which only the Nullable tool allows,
+    # so Required mode gets the one-line instruction only.
+    if schema_mode == "Required":
+        tool, system = get_extraction_tool(), SYSTEM_PROMPT
+    else:
+        tool, system = get_nullable_extraction_tool(), NULLABLE_SYSTEM_PROMPT
 
     # The conversation so far. Retries add to it; nothing earlier is ever changed.
     messages = [{"role": "user", "content": document_text}]
 
     with st.spinner("Extracting..."):
-        response = call_claude(messages, tool)
+        response = call_claude(messages, tool, system)
 
     # "tool_use" is the normal value here: it means Claude called the tool.
     st.write(f"**stop_reason:** {response.stop_reason}")
@@ -385,7 +564,7 @@ if st.button("Extract"):
         })
 
         with st.spinner(f"Numbers don't add up. Asking Claude to re-read (retry {retries_used} of {MAX_RETRIES})..."):
-            response = call_claude(messages, tool)
+            response = call_claude(messages, tool, system)
 
         new_tool_block = find_tool_block(response)
         if new_tool_block is None:
@@ -414,6 +593,18 @@ if st.button("Extract"):
 
     st.write(f"**Mode:** {schema_mode}")
 
+    # Overall verdict first: a person should check this one if Claude was unsure of
+    # any key field, or if the numbers still don't add up.
+    low_fields = low_confidence_fields(extraction)
+    if low_fields or errors:
+        st.badge("Needs human review", color="red")
+        reasons = []
+        if low_fields:
+            reasons.append(f"low confidence: {', '.join(low_fields)}")
+        if errors:
+            reasons.append("the numbers don't add up (see Arithmetic check below)")
+        st.caption("Why: " + "; ".join(reasons))
+
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Type", extraction.document_type)
     col2.metric("Vendor", show_text(extraction.vendor_name))
@@ -426,6 +617,25 @@ if st.button("Extract"):
     col1.metric("Subtotal", show_money(extraction.subtotal))
     col2.metric("Tax", show_money(extraction.tax))
     col3.metric("Total", show_money(extraction.total))
+
+    # One row per key field: its value, how sure Claude was, and a red badge if it was unsure.
+    # Built from columns rather than st.dataframe, because a dataframe can't hold badges.
+    st.subheader("Field review")
+    if extraction.confidence is None:
+        st.caption("Required mode doesn't ask for confidence, so that column shows —.")
+    header = st.columns([2, 2, 1, 2])
+    for column, title in zip(header, ["Field", "Value", "Confidence", ""]):
+        column.markdown(f"**{title}**")
+    for name in KEY_FIELDS:
+        value = getattr(extraction, name)
+        confidence = getattr(extraction.confidence, name) if extraction.confidence else None
+        field_col, value_col, confidence_col, review_col = st.columns([2, 2, 1, 2])
+        field_col.write(name)
+        value_col.write(show_money(value) if name in MONEY_FIELDS else show_text(value))
+        confidence_col.write(show_text(confidence))
+        if confidence == "low":
+            with review_col:
+                st.badge("Needs review", color="red")
 
     st.subheader("Not stated in document")
     missing = find_missing_fields(extraction)
